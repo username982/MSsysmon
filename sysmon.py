@@ -77,15 +77,16 @@ C_CRIT   = "#ff3c50"
 C_ACCENT = "#00ccff"
 
 # ─── Layout constants ────────────────────────────────────────────────────────
-PAD      = 13
-ROW_H    = 20
-BAR_H    = 5
-CORE_W   = 15
-CORE_H   = 28
-CORE_GAP = 3
-TITLE_H  = 30
-SEP_H    = 12
-FOOT_H   = 10
+PAD       = 11
+ROW_H     = 20
+BAR_H     = 5
+TITLE_H   = 30
+SEP_H     = 10
+FOOT_H    = 8
+FIXED_W   = 210        # overlay always this wide
+# Core grid
+CELL      = 17         # square cell size (px)
+CELL_GAP  = 2          # gap between cells
 
 def _pct_col(p):
     if p < 60: return C_CPU
@@ -469,7 +470,7 @@ class Overlay:
         groups = self._groups(sections)
         H += (len(groups) - 1) * SEP_H  if len(groups) > 1 else 0
         for sec in sections:
-            H += self._sec_h(sec)
+            H += self._sec_h(sec, n_cores)
         H += FOOT_H
 
         cv.configure(width=W, height=H)
@@ -611,54 +612,82 @@ class Overlay:
 
         return y + ROW_H + BAR_H + 10
 
-    # ── Per-core vertical bars ────────────────────────────────────────────────
+    # ── Per-core grid (Task-Manager style) ───────────────────────────────────
     def _cores(self, cv, y, W, cores):
-        n    = len(cores)
+        n = len(cores)
         if n == 0: return y
 
         cv.create_text(PAD, y + 3, text="CORES",
                        font=("Consolas", 7, "bold"), fill=FG2, anchor="nw")
         cy = y + 14
 
+        # Pick columns so the grid fits within W - 2*PAD
+        inner_w  = W - 2 * PAD
+        n_cols   = self._core_cols(n, inner_w)
+        n_rows   = (n + n_cols - 1) // n_cols
+
         for i, pct in enumerate(cores):
-            x    = PAD + i * (CORE_W + CORE_GAP)
-            pct  = max(0.0, min(100.0, float(pct)))
-            col  = _pct_col(pct)
+            col_i = i % n_cols
+            row_i = i // n_cols
+            cx = PAD + col_i * (CELL + CELL_GAP)
+            ry = cy  + row_i * (CELL + CELL_GAP)
+            pct = max(0.0, min(100.0, float(pct)))
 
-            # Background
-            self._rrect(cv, x, cy, x + CORE_W, cy + CORE_H, 3,
-                        fill=SURFACE, outline="")
-            # Fill from bottom
-            fh = max(0, int(CORE_H * pct / 100))
-            if fh >= 2:
-                fy = cy + CORE_H - fh
-                self._rrect(cv, x, fy, x + CORE_W, cy + CORE_H, 3,
-                            fill=col, outline="")
-                # top shimmer
-                if fh > 4:
-                    self._rrect(cv, x, fy, x + CORE_W, fy + 2, 1,
-                                fill=self._dim(col, 1.4), outline="")
+            # Background cell
+            self._rrect(cv, cx, ry, cx + CELL, ry + CELL, 2,
+                        fill=SURFACE, outline=BORDER, width=1)
 
-            # Core number (small, below bar)
-            cv.create_text(x + CORE_W // 2, cy + CORE_H + 3,
-                           text=str(i),
-                           font=("Consolas", 6), fill=FG2, anchor="n")
+            # Filled cell — colour blended from dark to accent by usage
+            if pct > 1.0:
+                fill_col = self._blend(BG, _pct_col(pct), pct / 100.0)
+                self._rrect(cv, cx, ry, cx + CELL, ry + CELL, 2,
+                            fill=fill_col, outline="")
+                # top-edge shimmer at high load
+                if pct > 50:
+                    bright = self._dim(_pct_col(pct), 1.5)
+                    cv.create_line(cx + 3, ry + 1, cx + CELL - 3, ry + 1,
+                                   fill=bright, width=1)
 
-        return cy + CORE_H + 10
+        grid_h = n_rows * CELL + (n_rows - 1) * CELL_GAP
+        return cy + grid_h + 8
+
+    @staticmethod
+    def _core_cols(n, inner_w):
+        """Pick the largest column count that fits within inner_w pixels."""
+        # prefer powers-of-2 column counts: 4, 8, 16
+        for cols in (16, 8, 4, 2, 1):
+            needed = cols * CELL + (cols - 1) * CELL_GAP
+            if needed <= inner_w and cols <= n:
+                return cols
+        return max(1, n)
+
+    @staticmethod
+    def _blend(hex_a, hex_b, t):
+        """Linear interpolate two hex colours; t=0→a, t=1→b."""
+        try:
+            def _p(h): h=h.lstrip("#"); return int(h[0:2],16),int(h[2:4],16),int(h[4:6],16)
+            ra,ga,ba = _p(hex_a)
+            rb,gb,bb = _p(hex_b)
+            r = int(ra + (rb-ra)*t)
+            g = int(ga + (gb-ga)*t)
+            b = int(ba + (bb-ba)*t)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return hex_b
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _calc_W(self, n_cores):
-        min_w = 240
-        if n_cores <= 0:
-            return min_w
-        cores_w = PAD + n_cores * CORE_W + (n_cores - 1) * CORE_GAP + PAD
-        return max(min_w, min(cores_w, 500))
+        return FIXED_W
 
-    def _sec_h(self, sec):
+    def _sec_h(self, sec, n_cores=0):
         if sec in ("cpu", "ram", "gpu", "vram"):
             return ROW_H + BAR_H + 10
         if sec == "cores":
-            return 14 + CORE_H + 10
+            if n_cores == 0: return 0
+            inner_w = FIXED_W - 2 * PAD
+            n_cols  = self._core_cols(n_cores, inner_w)
+            n_rows  = (n_cores + n_cols - 1) // n_cols
+            return 14 + n_rows * CELL + (n_rows - 1) * CELL_GAP + 8
         return 0
 
     def _groups(self, sections):
